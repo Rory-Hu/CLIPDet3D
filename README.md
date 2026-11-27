@@ -1,11 +1,10 @@
 # CLIPDet3D
 
-Official implementation of **CLIPDet3D**, a camera-only 3D object detector for
-nuScenes that combines CLIP visual-language features, geometry-aware BEV
-lifting, temporal fusion, foreground prompting, and optional monocular-depth
-feature distillation.
+Official implementation of **CLIPDet3D: Vision-Language Collaborative Distillation for 3D Object Detection**, published in *Proceedings of the AAAI Conference on Artificial Intelligence (AAAI-26)*, 2026.
 
-DOI: [10.1109/TITS.2025.3639680](https://doi.org/10.1109/TITS.2025.3639680)
+> Jiaqi Zhao, Huanfeng Hu, Yong Zhou, Wen-Liang Du, Kunyang Sun, Rui Yao, and Qigong Sun. DOI: [10.1609/aaai.v40i16.38316](https://doi.org/10.1609/aaai.v40i16.38316)
+
+CLIPDet3D is a camera-only multi-view 3D object detector that combines CLIP visual-language priors, depth feature contrastive distillation, and dual-stream prompt attention to improve detection under long-tailed category distributions.
 
 The released source has been checked against the published R50 and R101 EMA
 checkpoints. Every model parameter name and tensor shape matches the two
