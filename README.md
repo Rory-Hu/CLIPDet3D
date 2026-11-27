@@ -5,6 +5,8 @@ nuScenes that combines CLIP visual-language features, geometry-aware BEV
 lifting, temporal fusion, foreground prompting, and optional monocular-depth
 feature distillation.
 
+DOI: [10.1109/TITS.2025.3639680](https://doi.org/10.1109/TITS.2025.3639680)
+
 The released source has been checked against the published R50 and R101 EMA
 checkpoints. Every model parameter name and tensor shape matches the two
 checkpoints exactly.
@@ -28,13 +30,6 @@ Download the released EMA checkpoints from the
 
 - `CLIPDet3D_R50_256x704_epoch10_ema.pth`
 - `CLIPDet3D_R101_512x1408_epoch20_ema.pth`
-
-SHA-256 checksums:
-
-```text
-c8a878ef1d5f71d50c226189d853b75acc0f0873ca522bc0575ed66766a2266e  CLIPDet3D_R50_256x704_epoch10_ema.pth
-96e4d36f6b987f22733d70c4f4603c628eb2011154c83e4070d2da52e1e745f8  CLIPDet3D_R101_512x1408_epoch20_ema.pth
-```
 
 Place the downloaded model weights in `work_dirs/` or another path of your
 choice. The R50 training configuration also uses the Depth Anything V2 ViT-S
