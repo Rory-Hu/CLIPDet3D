@@ -5,7 +5,7 @@ from mmcv.cnn import build_conv_layer
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp.autocast_mode import autocast
 from torch.utils.checkpoint import checkpoint
-
+from .dpt import DepthAnythingV2
 from mmdet.models.backbones.resnet import BasicBlock
 from ..builder import NECKS
 from .view_transformer import LSSViewTransformerBEVDepth, Mlp, SELayer, ASPP
@@ -109,13 +109,22 @@ class DepthNet(nn.Module):
         depth = self.depth_head(depth_feat)
         return depth, context, depth_feat
 
+class SpatialAttention(nn.Module):
+    def __init__(self, in_channels):  # 添加通道参数
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, 1, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        attn = torch.sigmoid(self.conv(x))
+        return x * attn  # 空间注意力加权
 
 @NECKS.register_module()
 class RCSample(LSSViewTransformerBEVDepth):
 
     def __init__(self, scale_num, ins_channels, downsamples, depth_loss_cfg, fg_loss_cfg, 
                  loss_depth_weight, loss_fg_weight, keep_threshold=None, with_cp=False, 
-                 depthnet_cfg=dict(), **kwargs):
+                 depthnet_cfg=dict(), use_distillation=False,
+                 teacher_checkpoint='ckpts/depth_anything_v2_vits.pth', **kwargs):
         super(RCSample, self).__init__(**kwargs)
         self.loss_depth_weight = loss_depth_weight
         self.loss_fg_weight = loss_fg_weight
@@ -135,6 +144,38 @@ class RCSample(LSSViewTransformerBEVDepth):
         self.fg_loss = BCEFocalLoss(**fg_loss_cfg)
         self.frustums = [self.create_frustum(self.grid_config['depth'], self.input_size, downsample) 
                         for downsample in self.downsamples]
+        self.is_train = False
+        self.use_distillation = use_distillation
+        if self.use_distillation:
+            self.depth_anything = DepthAnythingV2(
+                encoder='vits',
+                features=64,
+                out_channels=[48, 96, 192, 384],
+                use_bn=False,
+                use_clstoken=False
+            )
+            self.distill_adapters = nn.ModuleList([
+                nn.Sequential(nn.Conv2d(512, 48, 1), SpatialAttention(48)),
+                nn.Sequential(nn.Conv2d(512, 96, 1), SpatialAttention(96)),
+                nn.Sequential(nn.Conv2d(512, 192, 1), SpatialAttention(192)),
+            ])
+            for adapter in self.distill_adapters:
+                for module in adapter:
+                    if isinstance(module, nn.Conv2d):
+                        nn.init.kaiming_normal_(
+                            module.weight, mode='fan_out', nonlinearity='relu')
+                        module.weight.data = module.weight.data.contiguous()
+                        nn.init.constant_(module.bias, 0)
+                        module.bias.data = module.bias.data.contiguous()
+            self.depth_anything.load_state_dict(
+                torch.load(teacher_checkpoint, map_location='cpu'))
+            self.depth_anything.eval()
+            self.depth_anything.requires_grad_(False)
+
+        # Keep original conditional logic
+        if self.is_train and self.use_distillation:
+            model_device = next(self.parameters()).device
+            self.depth_anything = self.depth_anything.to(model_device)
         if self.accelerate:
             self.pre_bev_coor = None
 
@@ -308,12 +349,75 @@ class RCSample(LSSViewTransformerBEVDepth):
         inbox_label_mask = inbox_label.max(dim=1).values > 0
         gt_depths[inbox_label_mask] = inbox_label[inbox_label_mask]
         return fg_label.view(-1), gt_depths, centerness
+    @staticmethod
+    def dist2(self, tensor_a, tensor_b, mask=None):
+        """改进的特征距离计算函数"""
+        diff = (tensor_a - tensor_b) ** 2
+        if mask is not None:
+            diff = diff * mask
+        diff = torch.sum(diff, dim=tuple(range(1, diff.dim()))) ** 0.5
+        return diff.mean()
+    def linfengzhang_distill_loss(self, teacher_feat, student_feat, adapter_idx):
+        """完整的三阶段蒸馏损失实现"""
+        # 参数配置
+        S_T = 0.1  # 空间温度参数
+        C_T = 0.1  # 通道温度参数
+        kd_feat_loss_weight = 7e-5
+        kd_channel_loss_weight = 0.25
+        kd_spatial_loss_weight = 2.5e-3
 
+        # 获取特征图尺寸
+        B, C_t, H_t, W_t = teacher_feat.shape
+        _, C_s, H_s, W_s = student_feat.shape
+
+        # 第一阶段：空间注意力掩码（修复维度问题）
+        # 教师空间注意力 [B,1,H,W]
+        t_spatial_attn = torch.mean(torch.abs(teacher_feat), dim=1, keepdim=True)
+        t_spatial_attn = torch.softmax(t_spatial_attn.view(B, -1)/S_T, dim=1)
+        t_spatial_attn = t_spatial_attn.view(B, 1, H_t, W_t)  # 修正为[B,1,H,W]
+
+        # 学生空间注意力 [B,1,H,W]
+        s_spatial_attn = torch.mean(torch.abs(student_feat), dim=1, keepdim=True)
+        s_spatial_attn = torch.softmax(s_spatial_attn.view(B, -1)/S_T, dim=1)
+        s_spatial_attn = s_spatial_attn.view(B, 1, H_s, W_s)
+
+        # 第二阶段：通道注意力掩码
+        # 教师通道注意力 [B,C_t,1,1]
+        t_channel_attn = torch.mean(torch.abs(teacher_feat), [2,3], keepdim=True)
+        t_channel_attn = torch.softmax(t_channel_attn.view(B, C_t)/C_T, dim=1)
+        t_channel_attn = t_channel_attn.view(B, C_t, 1, 1)
+
+        # 学生通道注意力 [B,C_s,1,1]
+        s_channel_attn = torch.mean(torch.abs(student_feat), [2,3], keepdim=True)
+        s_channel_attn = torch.softmax(s_channel_attn.view(B, C_s)/C_T, dim=1)
+        s_channel_attn = s_channel_attn.view(B, C_s, 1, 1)
+
+        # 第三阶段：多维度损失计算
+        # 特征对齐损失
+        # import ipdb;ipdb.set_trace()
+        adapted_feat = self.distill_adapters[adapter_idx](student_feat)
+        kd_feat_loss = self.dist2(self, teacher_feat, adapted_feat,
+                                t_spatial_attn * t_channel_attn) * kd_feat_loss_weight
+
+        # 通道对齐损失
+        t_channel_mean = torch.mean(teacher_feat, [2,3])
+        s_channel_mean = torch.mean(adapted_feat, [2,3])
+        kd_channel_loss = F.mse_loss(t_channel_mean, s_channel_mean) * kd_channel_loss_weight
+
+        # 空间对齐损失
+        t_spatial_mean = torch.mean(teacher_feat, 1, keepdim=True)
+        s_spatial_mean = torch.mean(adapted_feat, 1, keepdim=True)
+        kd_spatial_loss = F.mse_loss(t_spatial_mean, s_spatial_mean) * kd_spatial_loss_weight
+
+        # 加权总损失
+        total_loss = (kd_feat_loss + kd_channel_loss + kd_spatial_loss)
+        return total_loss
     @force_fp32()
     def get_losses(self, gt_fg, gt_depths, fg_preds, inbox_preds, gt_bboxes_3d, coors):
         inbox_loss = 0
         fg_loss = 0
         for i in range(self.scale_num):
+            # import ipdb;ipdb.set_trace()
             fg_label, inbox_label, centerness = self.get_downsampled_labels(gt_fg, gt_depths, self.downsamples[i], gt_bboxes_3d, coors[i])
             inbox_pred = inbox_preds[i].permute(0, 2, 3, 1).contiguous().view(-1, self.D)
             fg_pred = fg_preds[i].contiguous().view(-1)
@@ -331,21 +435,59 @@ class RCSample(LSSViewTransformerBEVDepth):
             with autocast(enabled=False):
                 fg_loss += self.fg_loss(fg_pred, fg_label) * self.loss_fg_weight[i]
                 inbox_loss += self.depth_loss(inbox_pred, inbox_label, centerness) * self.loss_depth_weight[i]
-        return fg_loss, inbox_loss
+        target = torch.ones(self.depth_feat.size(0), device=self.depth_feat.device)
+        # 修改蒸馏损失计算部分
+        if not self.use_distillation:
+            return fg_loss, inbox_loss, fg_loss.new_zeros(())
+        distill_loss = 0
+        for i, (teacher_feat, adapter) in enumerate(zip(self.teacher_features, self.distill_adapters)):
+            with torch.no_grad():
+                teacher_feat = teacher_feat.float()
+
+            # 学生特征处理
+            student_feat = F.adaptive_avg_pool2d(
+                F.normalize(self.depth_feat, p=2, dim=1),
+                teacher_feat.shape[2:]
+            )
+
+            # 使用新的蒸馏损失计算
+            layer_loss = self.linfengzhang_distill_loss(teacher_feat, student_feat, i)
+            distill_loss += layer_loss
+
+        # 添加梯度保护
+        distill_loss = torch.clamp(distill_loss, max=10.0) * 0.5
+        return fg_loss, inbox_loss, distill_loss
 
     @autocast(False)
     def forward(self, input, frame_id, is_train=False):
+        self.is_train = is_train
         (x, sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda,
-         mlp_input, prev_data, bda_paste) = input[:10]
+         mlp_input, prev_data, bda_paste, img) = input[:11]
 
         depths = []
         fgs = []
         B, N, C, H, W = x[0].shape
         depth_input = x[0].view(B * N, C, H, W).float()
+        b, n, c, h, w = img.shape
+        img = img.view(b * n, c, h, w).float()
+        if self.is_train and self.use_distillation:
+            with torch.no_grad():
+                # Pad input to be divisible by patch size (14 for ViT)
+                pad_h = (14 - h % 14) % 14
+                pad_w = (14 - w % 14) % 14
+                depth_input_padded = F.pad(img, (0, pad_w, 0, pad_h), mode='constant', value=0)
+                # Get teacher features from padded input
+
+                _, teacher_features = self.depth_anything(depth_input_padded)
+
+                # Crop features back to original size
+                teacher_features = [feat[:, :, :H, :W] for feat in teacher_features]
+            self.teacher_features = teacher_features[:3]
+        # import ipdb;ipdb.set_trace()
         depth, context, depth_feat = self.depth_net(depth_input, mlp_input)
         depths.append(depth[:, :self.D])
         fgs.append(depth[:, self.D:])
-
+        self.depth_feat = depth_feat
         for i in range(1, self.scale_num):
             B, N, C, H, W = x[i].shape
             img_feat = x[i].view(B * N, C, H, W).float()
@@ -367,7 +509,7 @@ class RCSample(LSSViewTransformerBEVDepth):
                                     context.permute(0, 3, 2, 1)).permute(0, 3, 2, 1).contiguous()
         _, C, D, W = frustum_feat.shape
         h, w, _ = self.bev_coor.shape
-
+        # import ipdb;ipdb.set_trace()
         if prev_data is None:
             bev_coor = self.bev_coor.clone().to(frustum_feat).unsqueeze(0).expand(B, -1, -1, -1)
             bev_coor = self.get_sample_coor(bev_coor, sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda)
@@ -403,8 +545,8 @@ class RCSample(LSSViewTransformerBEVDepth):
             bev_feat = torch.cat(bev_feat_list, dim=0)
         coors = None
 
-        if bev_feat.requires_grad:
-            coors = self.get_lidar_coors(*input[1:7], bda_paste=bda_paste)
+        # if bev_feat.requires_grad:
+        coors = self.get_lidar_coors(*input[1:7], bda_paste=bda_paste)
         
         curr_data = dict(depths=depths, fgs=fgs, coors=coors, frustum_feat=frustum_feat, 
                               transform=(sensor2ego, ego2global, cam2imgs, post_rots, post_trans, bda))

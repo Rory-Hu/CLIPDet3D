@@ -13,195 +13,8 @@ import clip
 import torch.nn as nn
 import math
 
-# CBR module (Conv + BatchNorm + ReLU)
-# class CBR(nn.Module):
-#     def __init__(self, in_c, out_c, kernel_size=3, padding=1, dilation=1, stride=1, act=True):
-#         super().__init__()
-#         self.act = act
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(in_c, out_c, kernel_size, padding=padding, dilation=dilation, bias=False, stride=stride),
-#             nn.BatchNorm2d(out_c)
-#         )
-#         # 增加卷积层初始化
-#         nn.init.kaiming_normal_(self.conv[0].weight, mode='fan_out', nonlinearity='relu')
-#         nn.init.constant_(self.conv[1].weight, 1.0)
-#         nn.init.constant_(self.conv[1].bias, 0.0)
-#         self.relu = nn.ReLU(inplace=True)
 
-#     def forward(self, x):
-#         # 增加显式内存拷贝确保连续
-#         x = x.contiguous(memory_format=torch.contiguous_format)
-#         conv = self.conv[0]
-#         bn = self.conv[1]
-        
-#         # 分解卷积操作并增加中间连续化
-#         x = conv(x)
-#         x = x.contiguous(memory_format=torch.contiguous_format)  # 强制拷贝内存
-        
-#         # BN前使用clone确保内存布局
-#         x = bn(x.clone())
-        
-#         if self.act:
-#             x = self.relu(x)
-#         return x.contiguous(memory_format=torch.contiguous_format)
 
-# class UNetPreprocess(nn.Module):
-#     def __init__(self, in_c, out_c, up_scale):
-#         super().__init__()
-#         # 编码器（下采样路径）调整为渐进式降维
-#         self.encoder = nn.Sequential(
-#             CBR(in_c, 64, kernel_size=3, padding=1, stride=2),  # 1024->512 (1/2)
-#             CBR(64, 32, kernel_size=3, padding=1, stride=2),    # 512->256 (1/4)
-#             CBR(32, 16, kernel_size=3, padding=1, stride=2)    # 256->128 (1/8)
-#         )
-        
-#         # 解码器（上采样路径）对应调整
-#         self.decoder = nn.Sequential(
-#             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-#             CBR(16, 32, 3, padding=1),
-#             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-#             CBR(32, 64, 3, padding=1),
-#             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
-#             CBR(64, out_c, 3, padding=1)
-#         )
-        
-#         # 残差连接通道对齐
-#         self.skip_conv = CBR(in_c, out_c, 1, padding=0)
-
-#     def forward(self, x):
-#         # 残差路径强制内存拷贝
-#         identity = self.skip_conv(x).clone().contiguous()
-        
-#         # 编码路径逐层连续化
-#         for layer in self.encoder:
-#             x = layer(x)
-#             x = x.contiguous(memory_format=torch.contiguous_format)
-        
-#         # 解码路径增加内存格式转换
-#         for i, layer in enumerate(self.decoder):
-#             if isinstance(layer, nn.Upsample):
-#                 x = x.contiguous(memory_format=torch.channels_last)  # 优化上采样内存布局
-#                 x = F.layer_norm(x, x.shape[-3:])  # 新增层归一化
-#             x = layer(x)
-#             x = x.contiguous(memory_format=torch.contiguous_format)
-        
-#         # 最终尺寸对齐
-#         if x.shape[-2:] != identity.shape[-2:]:
-#             x = F.interpolate(x, size=identity.shape[-2:], 
-#                             mode='bilinear', align_corners=True).contiguous()
-            
-#         return (x + identity).clone().contiguous()
-
-# class ContrastDrivenFeatureAggregation(nn.Module):
-#     def __init__(self, in_c, dim, num_heads, kernel_size=3, padding=1, stride=1,
-#                  attn_drop=0., proj_drop=0.):
-#         super().__init__()
-#         # 初始化参数增加限制
-#         self.norm1 = nn.LayerNorm(dim)
-#         self.norm2 = nn.LayerNorm(dim)
-#         self.dim = dim
-#         self.num_heads = num_heads
-#         self.kernel_size = kernel_size
-#         self.padding = padding
-#         self.stride = stride
-#         self.head_dim = dim // num_heads
-
-#         self.scale = self.head_dim ** -0.5
-#         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1) * 0.5)
-
-#         self.v = nn.Linear(dim, dim)
-#         self.attn_fg = nn.Linear(dim, kernel_size ** 4 * num_heads)
-#         self.attn_bg = nn.Linear(dim, kernel_size ** 4 * num_heads)
-
-#         self.attn_drop = nn.Dropout(attn_drop)
-#         self.proj = nn.Linear(dim, dim)
-#         self.proj_drop = nn.Dropout(proj_drop)
-
-#         self.unfold = nn.Unfold(kernel_size=kernel_size, padding=padding, stride=stride)
-#         self.pool = nn.AvgPool2d(kernel_size=stride, stride=stride, ceil_mode=True)
-
-#         self.input_cbr = nn.Sequential(
-#             CBR(in_c, dim, kernel_size=3, padding=1),
-#             CBR(dim, dim, kernel_size=3, padding=1),
-#         )
-#         self.output_cbr = nn.Sequential(
-#             CBR(dim, dim, kernel_size=3, padding=1),
-#             CBR(dim, dim, kernel_size=3, padding=1),
-#         )
-
-#         nn.init.xavier_normal_(self.attn_fg.weight, gain=1e-1)
-#         nn.init.constant_(self.attn_fg.bias, 0.)
-#         nn.init.xavier_normal_(self.attn_bg.weight, gain=1e-1)
-#         nn.init.constant_(self.attn_bg.bias, 0.)
-
-#     def forward(self, x, fg, bg):
-#         identity = x.clone()
-#         x = self.input_cbr(x)
-#         x = self.norm1(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-#         x = x.permute(0, 2, 3, 1).contiguous()
-#         fg = fg.permute(0, 2, 3, 1).contiguous()
-#         bg = bg.permute(0, 2, 3, 1).contiguous()
-
-#         B, H, W, C = x.shape
-
-#         v = self.v(x).permute(0, 3, 1, 2).contiguous()
-
-#         v_unfolded = self.unfold(v).reshape(B, self.num_heads, self.head_dim,
-#                                             self.kernel_size * self.kernel_size,
-#                                             -1).permute(0, 1, 4, 3, 2)
-#         attn_fg = self.compute_attention(fg, B, H, W, C, 'fg')
-
-#         x_weighted_fg = self.apply_attention(attn_fg, v_unfolded, B, H, W, C)
-
-#         v_unfolded_bg = self.unfold(x_weighted_fg.permute(0, 3, 1, 2)).reshape(B, self.num_heads, self.head_dim,
-#                                                                                self.kernel_size * self.kernel_size,
-#                                                                                -1).permute(0, 1, 4, 3, 2)
-#         attn_bg = self.compute_attention(bg, B, H, W, C, 'bg')
-
-#         x_weighted_bg = self.apply_attention(attn_bg, v_unfolded_bg, B, H, W, C)
-
-#         x_weighted_bg = x_weighted_bg.permute(0, 3, 1, 2).contiguous()
-
-#         out = self.output_cbr(x_weighted_bg)
-#         out = self.output_cbr(x_weighted_bg) + identity
-#         out = self.norm2(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-#         return out
-
-#     def compute_attention(self, feature_map, B, H, W, C, feature_type):
-
-#         attn_layer = self.attn_fg if feature_type == 'fg' else self.attn_bg
-#         h, w = math.ceil(H / self.stride), math.ceil(W / self.stride)
-
-#         feature_map_pooled = self.pool(feature_map.permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
-
-#         attn = attn_layer(feature_map_pooled).reshape(B, h * w, self.num_heads,
-#                                                       self.kernel_size * self.kernel_size,
-#                                                       self.kernel_size * self.kernel_size).permute(0, 2, 1, 3, 4)
-#         # 增加温度缩放和数值稳定处理
-#         attn = attn * self.scale / self.temperature.view(1, self.num_heads, 1, 1, 1)
-#         attn = attn - attn.max(dim=-1, keepdim=True)[0]  # 数值稳定
-#         attn = attn - attn.max(dim=-1, keepdim=True)[0]  # 数值稳定
-#         attn = F.softmax(attn / math.sqrt(self.head_dim), dim=-1)  # 增加缩放因子
-#         attn = torch.clamp(attn, min=1e-5, max=1.0-1e-5)  # 添加截断
-#         attn = self.attn_drop(attn)
-#         return attn
-
-#     def apply_attention(self, attn, v, B, H, W, C):
-        
-#         v = torch.clamp(v, -5.0, 5.0)
-#         v = torch.tanh(v / 3.0) * 3.0  # 更平滑的激活函数限制
-#         x_weighted = (attn @ v).permute(0, 1, 4, 3, 2).reshape(
-#             B, self.dim * self.kernel_size * self.kernel_size, -1)
-#         torch.nn.utils.clip_grad_norm_(self.parameters(), 2.0)
-#         x_weighted = F.fold(x_weighted, output_size=(H, W), kernel_size=self.kernel_size,
-#                             padding=self.padding, stride=self.stride)
-#         x_weighted = self.proj(x_weighted.permute(0, 2, 3, 1))
-#         x_weighted = self.proj_drop(x_weighted)
-#         x_weighted = F.layer_norm(x_weighted, [self.dim])
-#         x_weighted = torch.clamp(x_weighted, -10.0, 10.0)  # 新增输出截断
-        
-#         return x_weighted
-    
 class CrossAttention(nn.Module):
 
     def __init__(self, input_dim, output_dim):
@@ -361,6 +174,7 @@ class CLIPBEV(BEVDepth4D):
                  text_context_decoder=None,
                  context_length = 25,
                  in_dim = 80,
+                 fg_norm_shape = (16, 44),
                  **kwargs):
         super(CLIPBEV, self).__init__(**kwargs)
         self.scale_num = scale_num
@@ -383,7 +197,7 @@ class CLIPBEV(BEVDepth4D):
         self.num = len(self.class_names)
         if context_length > 10:
             self.texts = torch.cat(
-                [clip.tokenize(f"In this aerial photo, a {label} can be found.",
+                [clip.tokenize(f"In this photo, a {label} can be found.",
                                context_length=self.context_length) for label in self.class_names])
         else:
             self.texts = torch.cat(
@@ -413,7 +227,7 @@ class CLIPBEV(BEVDepth4D):
             nn.GroupNorm(4, 32),  # 更细粒度的分组
             nn.LeakyReLU(0.1, inplace=True),
             nn.Conv2d(32, 1, 1),
-            nn.LayerNorm([1, 16, 44]),  # 新增空间维度归一化
+            nn.LayerNorm([1, *fg_norm_shape]),
             nn.Hardtanh(min_val=-5, max_val=5)  # 缩小输出范围
         )
         # 改进初始化策略
